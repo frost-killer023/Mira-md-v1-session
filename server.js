@@ -22,8 +22,16 @@ let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
 
-// Logger configuration
-const logger = pino({ level: 'silent' });
+// Logger with more details
+const logger = pino({ 
+  level: 'debug',
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true
+    }
+  }
+});
 
 // Session path setup
 const sessionPath = path.join(__dirname, 'session');
@@ -34,42 +42,39 @@ const sessionPath = path.join(__dirname, 'session');
 async function ensureSessionDirectory() {
   try {
     await fs.mkdir(sessionPath, { recursive: true });
-    console.log(`📁 Session directory ready: ${sessionPath}`);
+    console.log(`📁 Session directory: ${sessionPath}`);
     return true;
   } catch (error) {
-    console.error('⚠️ Failed to create session directory:', error.message);
+    console.error('⚠️ Session error:', error.message);
     return false;
   }
 }
 
 // ═════════════════════════════════════════════════════════════════
-// INITIALIZE WHATSAPP SOCKET WITH PROPER CONNECTION HANDLING
+// INITIALIZE WHATSAPP SOCKET
 // ═════════════════════════════════════════════════════════════════
 async function initializeSocket() {
   if (socket && socketReady.ready) {
-    console.log('🔄 Socket already ready, skipping re-initialization');
+    console.log('✓ Socket already ready');
     return socket;
   }
 
   if (socketInitializing) {
-    console.log('⏳ Socket initialization already in progress...');
+    console.log('⏳ Socket already initializing...');
     return null;
   }
 
   socketInitializing = true;
-  console.log('🚀 Initializing WhatsApp socket...');
+  console.log('\n🚀 Starting socket initialization...');
 
   try {
-    // Load or create authentication state
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    console.log('✓ Auth state loaded');
 
-    console.log('🔐 Auth state loaded');
-
-    // Create socket with optimized config
     socket = makeWASocket({
       auth: state,
       printQRInTerminal: false,
-      logger: logger,
+      logger: pino({ level: 'silent' }),
       browser: ['MIRA-BOT', 'Chrome', '125.0.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
@@ -77,76 +82,61 @@ async function initializeSocket() {
       shouldCacheMessages: false,
       generateHighQualityLinkPreview: false,
       retryRequestDelayMs: 100,
-      maxRetries: 3,
-      version: [2, 2333, 8]
+      maxRetries: 3
     });
 
-    console.log('✅ Socket created');
+    console.log('✓ Socket created');
 
-    // Save credentials when updated
+    // Auto-save credentials
     socket.ev.on('creds.update', saveCreds);
 
-    // Track connection state
-    let connectionTimeout;
-
-    // Handle connection updates
-    socket.ev.on('connection.update', async (update) => {
+    // Connection handler
+    socket.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
+      if (qr) {
+        console.log('→ QR Code received');
+      }
+
       if (connection === 'connecting') {
-        console.log('🔌 Connecting to WhatsApp...');
-        // Reset timeout on each connection attempt
-        if (connectionTimeout) clearTimeout(connectionTimeout);
-        connectionTimeout = setTimeout(() => {
-          if (!socketReady.ready) {
-            console.log('⏱️ Connection attempt timeout');
-            socket.end(new Error('Connection timeout'));
-          }
-        }, 30000);
+        console.log('→ Attempting connection...');
       }
 
       if (connection === 'open') {
-        if (connectionTimeout) clearTimeout(connectionTimeout);
         socketReady.ready = true;
         socketInitializing = false;
-        console.log('🟢 WhatsApp socket connected!');
-        if (socket.user && socket.user.id) {
-          console.log(`👤 User: ${socket.user.id}`);
+        console.log('✓ Socket CONNECTED');
+        if (socket.user?.id) {
+          console.log(`✓ User: ${socket.user.id}`);
         }
       }
 
       if (connection === 'close') {
-        if (connectionTimeout) clearTimeout(connectionTimeout);
         socketReady.ready = false;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        console.log(`→ Connection closed (code: ${code})`);
         
-        const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-
-        if (shouldReconnect) {
-          console.log('🔄 Reconnecting...');
+        if (code !== DisconnectReason.loggedOut) {
+          console.log('→ Will retry on next request');
           socket = null;
           socketInitializing = false;
         } else {
-          console.log('❌ Logged out');
+          console.log('→ Logged out');
           socket = null;
           socketInitializing = false;
         }
       }
-
-      if (qr) {
-        console.log('📲 QR Code available');
-      }
     });
 
-    // Handle errors
     socket.ev.on('connection.error', (error) => {
-      console.error('❌ Connection error:', error.message);
+      console.error('✗ Connection error:', error?.message);
     });
 
-    console.log('📡 Event listeners registered');
+    console.log('✓ Listeners registered\n');
 
   } catch (error) {
     socketInitializing = false;
-    console.error('❌ Socket error:', error.message);
+    console.error('✗ Init error:', error.message);
     socket = null;
     throw error;
   }
@@ -156,9 +146,9 @@ async function initializeSocket() {
 // WAIT FOR SOCKET READY
 // ═════════════════════════════════════════════════════════════════
 async function waitForSocketReady(maxWait = 90000) {
-  const startTime = Date.now();
+  const start = Date.now();
   
-  while (!socketReady.ready && (Date.now() - startTime) < maxWait) {
+  while (!socketReady.ready && (Date.now() - start) < maxWait) {
     await delay(500);
   }
   
@@ -166,7 +156,7 @@ async function waitForSocketReady(maxWait = 90000) {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// FRONTEND - STATUS UI
+// FRONTEND
 // ═════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.send(`
@@ -175,19 +165,11 @@ app.get('/', (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>MIRA-BOT-V1 • Code de Pairage</title>
+      <title>MIRA-BOT-V1 • Pairage WhatsApp</title>
       <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
       <style>
-        :root {
-          --gradient-btn: linear-gradient(135deg, #5b7fff 0%, #9053cd 100%);
-        }
-
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
         body {
           font-family: 'Plus Jakarta Sans', sans-serif;
           background: #090d1a;
@@ -206,7 +188,7 @@ app.get('/', (req, res) => {
           background: rgba(255, 255, 255, 0.03);
           backdrop-filter: blur(20px);
           border: 1px solid rgba(255, 255, 255, 0.08);
-          padding: 40px 30px;
+          padding: 40px;
           border-radius: 28px;
           width: 100%;
           max-width: 400px;
@@ -214,7 +196,7 @@ app.get('/', (req, res) => {
           box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
         }
 
-        .icon-container {
+        .icon {
           width: 70px;
           height: 70px;
           background: linear-gradient(135deg, rgba(91, 127, 255, 0.3) 0%, rgba(144, 83, 205, 0.3) 100%);
@@ -226,46 +208,30 @@ app.get('/', (req, res) => {
           box-shadow: 0 8px 20px rgba(144, 83, 205, 0.2);
         }
 
-        .icon-container svg {
-          width: 32px;
-          height: 32px;
-          fill: none;
-          stroke: #c8a2ff;
-          stroke-width: 2.5;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-        }
-
         h1 {
           font-size: 26px;
           font-weight: 700;
           margin-bottom: 8px;
-          letter-spacing: 0.5px;
           background: linear-gradient(135deg, #fff 60%, #dcd0ff 100%);
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
         }
 
-        .subtitle {
-          font-size: 14px;
-          color: #7e8ca4;
-          margin-bottom: 25px;
-        }
+        .subtitle { font-size: 14px; color: #7e8ca4; margin-bottom: 25px; }
 
-        .status-box {
-          padding: 12px 16px;
+        .status {
+          padding: 12px;
           background: rgba(91, 127, 255, 0.1);
           border: 1px solid rgba(91, 127, 255, 0.3);
           border-radius: 12px;
           font-size: 12px;
-          color: #a4b3cd;
           margin-bottom: 20px;
           display: flex;
           align-items: center;
           gap: 8px;
         }
 
-        .status-dot {
+        .dot {
           width: 8px;
           height: 8px;
           border-radius: 50%;
@@ -273,17 +239,11 @@ app.get('/', (req, res) => {
           animation: pulse 2s infinite;
         }
 
-        .status-dot.ready {
-          background: #4ade80;
-          animation: none;
-        }
+        .dot.ready { background: #4ade80; animation: none; }
 
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-        .input-label {
+        label {
           text-align: left;
           font-size: 12px;
           font-weight: 600;
@@ -291,12 +251,11 @@ app.get('/', (req, res) => {
           color: #8fa0be;
           margin-bottom: 8px;
           display: block;
-          padding-left: 4px;
         }
 
         input {
           width: 100%;
-          padding: 16px 20px;
+          padding: 16px;
           background: rgba(255, 255, 255, 0.04);
           border: 1px solid rgba(255, 255, 255, 0.1);
           border-radius: 14px;
@@ -316,33 +275,22 @@ app.get('/', (req, res) => {
         button {
           width: 100%;
           padding: 16px;
-          background: var(--gradient-btn);
+          background: linear-gradient(135deg, #5b7fff 0%, #9053cd 100%);
           border: none;
           border-radius: 14px;
           color: #fff;
           font-size: 16px;
           font-weight: 600;
           cursor: pointer;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          gap: 8px;
+          margin-bottom: 15px;
           transition: 0.3s;
           box-shadow: 0 10px 20px rgba(114, 107, 243, 0.2);
-          margin-bottom: 15px;
         }
 
-        button:hover:not(:disabled) {
-          opacity: 0.95;
-          transform: translateY(-1px);
-        }
+        button:hover:not(:disabled) { opacity: 0.95; transform: translateY(-1px); }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
 
-        button:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-        }
-
-        .result-box {
+        .result {
           border: 1px dashed rgba(255, 255, 255, 0.15);
           border-radius: 16px;
           padding: 20px;
@@ -356,14 +304,13 @@ app.get('/', (req, res) => {
           align-items: center;
         }
 
-        .code-output {
+        .code {
           font-size: 36px;
           font-weight: 700;
           color: #fff;
           letter-spacing: 4px;
           margin: 12px 0;
-          text-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
-          font-family: 'Courier New', monospace;
+          font-family: monospace;
         }
 
         .loader {
@@ -376,115 +323,105 @@ app.get('/', (req, res) => {
           animation: spin 0.8s linear infinite;
         }
 
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
       </style>
     </head>
     <body>
       <div class="card">
-        <div class="icon-container">
-          <svg viewBox="0 0 24 24">
+        <div class="icon">
+          <svg style="width:32px;height:32px;fill:none;stroke:#c8a2ff;stroke-width:2.5" viewBox="0 0 24 24">
             <polyline points="16 18 22 12 16 6"></polyline>
             <polyline points="8 6 2 12 8 18"></polyline>
           </svg>
         </div>
 
         <h1>MIRA-BOT-V1</h1>
-        <div class="subtitle">Générateur de Code de Pairage WhatsApp</div>
+        <div class="subtitle">Code de Pairage WhatsApp</div>
 
-        <div class="status-box">
-          <div class="status-dot" id="statusDot"></div>
-          <span id="statusLabel">Initialisation...</span>
+        <div class="status">
+          <div class="dot" id="dot"></div>
+          <span id="label">Initialisation...</span>
         </div>
 
-        <form id="pairingForm">
-          <label class="input-label">Numéro de téléphone</label>
-          <input type="text" id="phoneNumber" placeholder="25766486303" required>
-          
-          <button type="submit" id="submitBtn" disabled>
-            <svg style="width:18px; height:18px; fill:currentColor;" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            <span id="btnText">Générer le Code</span>
-          </button>
+        <form id="form">
+          <label>Numéro de téléphone</label>
+          <input type="tel" id="phone" placeholder="25766486303" required>
+          <button type="submit" id="btn" disabled>Générer le Code</button>
         </form>
 
-        <div class="result-box" id="resultBox">
+        <div class="result" id="result">
           <div class="loader" id="loader"></div>
-          <span id="statusText">En attente du service...</span>
+          <span id="text">En attente...</span>
         </div>
       </div>
 
       <script>
-        async function checkStatus() {
+        async function updateStatus() {
           try {
-            const response = await fetch('/health');
-            const data = await response.json();
-            const dot = document.getElementById('statusDot');
-            const label = document.getElementById('statusLabel');
-            const btn = document.getElementById('submitBtn');
+            const res = await fetch('/health');
+            const data = await res.json();
+            const dot = document.getElementById('dot');
+            const label = document.getElementById('label');
+            const btn = document.getElementById('btn');
             
             if (data.socketReady) {
               dot.classList.add('ready');
-              label.textContent = '✅ Service prêt';
+              label.textContent = '✅ Prêt';
               btn.disabled = false;
-              document.getElementById('statusText').textContent = 'Entrez votre numéro';
+              document.getElementById('text').textContent = 'Entrez votre numéro';
             } else {
               dot.classList.remove('ready');
-              label.textContent = data.socketInitializing ? '🔌 Connexion...' : '⏳ En attente...';
+              label.textContent = data.socketInitializing ? '🔌 Connexion...' : '⏳ Attente...';
               btn.disabled = true;
             }
-          } catch (err) {
-            document.getElementById('statusLabel').textContent = '❌ Erreur serveur';
+          } catch (e) {
+            document.getElementById('label').textContent = '❌ Erreur serveur';
           }
         }
 
-        checkStatus();
-        setInterval(checkStatus, 2000);
+        updateStatus();
+        setInterval(updateStatus, 2000);
 
-        document.getElementById('pairingForm').addEventListener('submit', async (e) => {
+        document.getElementById('form').addEventListener('submit', async (e) => {
           e.preventDefault();
+          const num = document.getElementById('phone').value.replace(/\\D/g, '');
           
-          const num = document.getElementById('phoneNumber').value.replace(/[^0-9]/g, '');
-          if (!num || num.length < 10) {
-            document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">Numéro invalide!</span>';
+          if (num.length < 10) {
+            document.getElementById('text').textContent = '❌ Numéro invalide';
             return;
           }
 
-          document.getElementById('submitBtn').disabled = true;
+          document.getElementById('btn').disabled = true;
           document.getElementById('loader').style.display = 'block';
-          document.getElementById('statusText').style.display = 'none';
-          document.getElementById('btnText').textContent = 'Génération...';
+          document.getElementById('text').style.display = 'none';
 
           try {
-            const response = await fetch('/pair', {
+            const res = await fetch('/pair', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ number: num })
             });
-            const data = await response.json();
+            const data = await res.json();
 
             document.getElementById('loader').style.display = 'none';
-            document.getElementById('statusText').style.display = 'block';
-            document.getElementById('submitBtn').disabled = false;
-            document.getElementById('btnText').textContent = 'Générer le Code';
+            document.getElementById('text').style.display = 'block';
+            document.getElementById('btn').disabled = false;
 
             if (data.code) {
-              const resultBox = document.getElementById('resultBox');
-              resultBox.style.borderColor = 'rgba(144, 83, 205, 0.5)';
-              document.getElementById('statusText').innerHTML = \`
-                <span style="color: #a4b3cd; font-size: 11px;">CODE DE PAIRAGE:</span>
-                <div class="code-output">\${data.code}</div>
-                <span style="font-size: 11px; margin-top: 8px;">Entrez ce code dans WhatsApp</span>
+              document.getElementById('result').style.borderColor = 'rgba(144, 83, 205, 0.5)';
+              document.getElementById('text').innerHTML = \`
+                <span style="font-size:11px;color:#a4b3cd">CODE:</span>
+                <div class="code">\${data.code}</div>
+                <span style="font-size:11px;margin-top:8px">Entrez dans WhatsApp</span>
               \`;
             } else {
-              document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">' + (data.error || 'Erreur') + '</span>';
+              document.getElementById('text').textContent = '❌ ' + (data.error || 'Erreur');
             }
           } catch (err) {
             document.getElementById('loader').style.display = 'none';
-            document.getElementById('statusText').style.display = 'block';
-            document.getElementById('submitBtn').disabled = false;
-            document.getElementById('btnText').textContent = 'Générer le Code';
-            document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">Erreur de connexion</span>';
+            document.getElementById('text').style.display = 'block';
+            document.getElementById('btn').disabled = false;
+            document.getElementById('text').textContent = '❌ Erreur connexion';
           }
         });
       </script>
@@ -494,68 +431,67 @@ app.get('/', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// PAIRING CODE ENDPOINT
+// PAIRING ENDPOINT
 // ═════════════════════════════════════════════════════════════════
 app.post('/pair', async (req, res) => {
   const phoneNumber = req.body.number;
 
+  console.log('\n📱 Pairing request:', phoneNumber);
+
   if (!phoneNumber || !/^\d{10,}$/.test(phoneNumber)) {
+    console.log('✗ Invalid number');
     return res.json({ error: 'Numéro invalide' });
   }
 
-  console.log(`\n📱 Pairing request: ${phoneNumber}`);
-
   try {
-    // Initialize socket if needed
+    // Initialize if needed
     if (!socket) {
-      console.log('→ Socket nécessaire, initialisation...');
+      console.log('→ Socket needed, initializing...');
       await initializeSocket();
+      await delay(1000);
     }
 
-    // Wait for connection (max 90 seconds)
-    console.log('→ Attente connexion WhatsApp...');
-    const isReady = await waitForSocketReady(90000);
+    // Wait for connection
+    console.log('→ Waiting for socket to be ready...');
+    const ready = await waitForSocketReady(90000);
 
-    if (!isReady) {
-      console.log('✗ Socket non prêt après 90s');
-      return res.json({ error: 'WhatsApp n\'a pas répondu. Vérifiez votre connexion Internet.' });
+    if (!ready) {
+      console.log('✗ Socket NOT ready after 90s');
+      return res.json({ error: 'WhatsApp n\'est pas connecté. Vérifiez Internet.' });
     }
 
-    console.log('→ Socket connecté, demande du code...');
+    console.log('✓ Socket ready, requesting pairing code...');
 
     // Request pairing code
-    let pairingCode;
+    let code;
     try {
-      pairingCode = await socket.requestPairingCode(phoneNumber);
+      code = await socket.requestPairingCode(phoneNumber);
     } catch (err) {
-      console.error('✗ Code error:', err.message);
-      return res.json({ error: 'Impossible de générer le code. Réessayez.' });
+      console.error('✗ Code request failed:', err.message);
+      return res.json({ error: 'Impossible de générer le code.' });
     }
 
-    console.log(`✓ Code généré: ${pairingCode}\n`);
+    console.log('✓ Code generated:', code);
 
-    // Return code immediately
-    res.json({ code: pairingCode });
+    // Return immediately
+    res.json({ code });
 
-    // Handle post-pairing connection in background
+    // Send session ID after connection (background)
     setTimeout(() => {
-      const handlePostConnection = (update) => {
-        const { connection } = update;
-        
-        if (connection === 'open') {
-          console.log('→ Utilisateur connecté, envoi confirmation...');
-          socket.ev.removeListener('connection.update', handlePostConnection);
+      const handler = (update) => {
+        if (update.connection === 'open') {
+          console.log('→ User connected, sending session ID...');
+          socket.ev.removeListener('connection.update', handler);
           
           try {
-            const sessionId = Buffer.from(
-              JSON.stringify({
-                phoneNumber: socket.user?.id || 'unknown',
-                timestamp: new Date().toISOString(),
-                bot: 'MIRA-BOT-V1'
-              })
-            ).toString('base64');
+            const sessionId = Buffer.from(JSON.stringify({
+              phoneNumber: socket.user?.id || 'unknown',
+              timestamp: new Date().toISOString(),
+              bot: 'MIRA-BOT-V1'
+            })).toString('base64');
 
-            const msg = `╭───────────────────⬣
+            socket.sendMessage(socket.user.id, { 
+              text: `╭───────────────────⬣
 │ 🤖 *MIRA BOT V1*
 │ 
 │ ✅ Connexion Réussie
@@ -564,29 +500,24 @@ app.post('/pair', async (req, res) => {
 │ ${sessionId}
 │ \`\`\`
 │ 
-│ 📱 WhatsApp Linked Device
-│ ⚡ Système Opérationnel
-╰───────────────────⬣`;
-
-            socket.sendMessage(socket.user.id, { text: msg })
-              .then(() => console.log('✓ Confirmation envoyée\n'))
-              .catch(e => console.error('⚠ Envoi failed:', e.message));
-          } catch (error) {
-            console.error('⚠ Erreur confirmation:', error.message);
+│ 📱 WhatsApp Linked
+│ ⚡ Opérationnel
+╰───────────────────⬣` 
+            }).then(() => console.log('✓ Session ID sent\n'))
+              .catch(e => console.error('⚠ Send failed:', e.message));
+          } catch (e) {
+            console.error('⚠ Error:', e.message);
           }
         }
       };
 
-      socket.ev.on('connection.update', handlePostConnection);
-      
-      setTimeout(() => {
-        socket.ev.removeListener('connection.update', handlePostConnection);
-      }, 120000);
+      socket.ev.on('connection.update', handler);
+      setTimeout(() => socket.ev.removeListener('connection.update', handler), 120000);
     }, 100);
 
   } catch (error) {
-    console.error('✗ Erreur:', error.message);
-    res.json({ error: 'Erreur du service. Réessayez.' });
+    console.error('✗ Error:', error.message);
+    res.json({ error: 'Erreur serveur.' });
   }
 });
 
@@ -595,7 +526,6 @@ app.post('/pair', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({ 
-    status: 'ok',
     socketReady: socketReady.ready,
     socketInitializing: socketInitializing,
     uptime: process.uptime()
@@ -605,20 +535,17 @@ app.get('/health', (req, res) => {
 // ═════════════════════════════════════════════════════════════════
 // START SERVER
 // ═════════════════════════════════════════════════════════════════
-async function startServer() {
+async function start() {
   try {
     await ensureSessionDirectory();
 
     app.listen(PORT, () => {
-      console.log('\n╔════════════════════════════════════════╗');
-      console.log('║  🚀 MIRA-BOT-V1 DÉMARRÉ');
-      console.log(`║  🌐 Port: ${PORT}`);
-      console.log('║  📱 WhatsApp Pairing System');
-      console.log('║  💾 Session: ./session');
-      console.log('╚════════════════════════════════════════╝\n');
+      console.log('\n╔═══════════════════════════════════════╗');
+      console.log('║ 🚀 MIRA-BOT-V1 DÉMARRÉ');
+      console.log(`║ 🌐 http://localhost:${PORT}`);
+      console.log('╚═══════════════════════════════════════╝\n');
     });
 
-    // Start socket initialization
     initializeSocket().catch(err => {
       console.error('⚠ Socket init failed:', err.message);
     });
@@ -629,20 +556,20 @@ async function startServer() {
   }
 }
 
-startServer();
+start();
 
 // ═════════════════════════════════════════════════════════════════
-// GRACEFUL SHUTDOWN
+// SHUTDOWN
 // ═════════════════════════════════════════════════════════════════
 process.on('SIGTERM', () => {
-  console.log('\n📛 Shutdown signal');
-  if (socket) socket.end(new Error('Server stopping'));
+  console.log('\n📛 Stopping...');
+  if (socket) socket.end(new Error('Stopping'));
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('\n📛 Interrupt signal');
-  if (socket) socket.end(new Error('Server stopping'));
+  console.log('\n📛 Interrupted...');
+  if (socket) socket.end(new Error('Interrupted'));
   process.exit(0);
 });
 
