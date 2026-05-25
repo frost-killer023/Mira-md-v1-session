@@ -21,6 +21,7 @@ app.use(express.json());
 let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
+let socketReadyResolver = null;
 
 // Logger configuration
 const logger = pino({ level: 'silent' });
@@ -55,7 +56,7 @@ async function initializeSocket() {
     console.log('⏳ Socket initialization already in progress...');
     // Wait for initialization to complete
     let attempts = 0;
-    while (socketInitializing && attempts < 50) {
+    while (socketInitializing && attempts < 120) {
       await delay(100);
       attempts++;
     }
@@ -71,7 +72,7 @@ async function initializeSocket() {
 
     console.log('🔐 Auth state loaded from ./session');
 
-    // Create socket instance
+    // Create socket instance with longer timeouts
     socket = makeWASocket({
       auth: state,
       printQRInTerminal: false,
@@ -79,7 +80,11 @@ async function initializeSocket() {
       browser: ['MIRA-BOT', 'Chrome', '125.0.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: true,
-      emitOwnEventsOnReceive: false
+      emitOwnEventsOnReceive: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      shouldSyncHistoryMessage: false,
+      retryRequestDelayMs: 100
     });
 
     console.log('✅ Socket created successfully');
@@ -101,6 +106,11 @@ async function initializeSocket() {
         console.log('🟢 WhatsApp socket connected successfully');
         if (socket.user && socket.user.id) {
           console.log(`👤 User JID: ${socket.user.id}`);
+        }
+        // Call resolver if waiting
+        if (socketReadyResolver) {
+          socketReadyResolver();
+          socketReadyResolver = null;
         }
       }
 
@@ -144,6 +154,40 @@ async function initializeSocket() {
     socket = null;
     throw error;
   }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// WAIT FOR SOCKET READY WITH TIMEOUT
+// ═════════════════════════════════════════════════════════════════
+async function waitForSocketReady(timeoutMs = 45000) {
+  // If already ready, return immediately
+  if (socketReady.ready) {
+    console.log('✅ Socket already ready');
+    return true;
+  }
+
+  console.log(`⏳ Waiting for socket to be ready (${timeoutMs}ms timeout)...`);
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      console.log('⏱️ Socket ready timeout');
+      socketReadyResolver = null;
+      resolve(false);
+    }, timeoutMs);
+
+    socketReadyResolver = () => {
+      clearTimeout(timeout);
+      socketReadyResolver = null;
+      resolve(true);
+    };
+
+    // Check if already ready
+    if (socketReady.ready) {
+      clearTimeout(timeout);
+      socketReadyResolver = null;
+      resolve(true);
+    }
+  });
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -435,35 +479,31 @@ app.post('/pair', async (req, res) => {
 
   console.log(`📱 Pair request for number: ${phoneNumber}`);
 
-  // Safety timeout: 35 seconds (Render takes ~10-15s for pairing)
+  // Safety timeout: 50 seconds
   let responseSent = false;
   const timeoutId = setTimeout(() => {
     if (!responseSent) {
       responseSent = true;
-      console.log('⏱️ Pairing timeout after 35 seconds');
-      return res.json({ error: 'Délai dépassé. Le serveur n\'a pas reçu le code WhatsApp.' });
+      console.log('⏱️ Pairing timeout after 50 seconds');
+      return res.json({ error: 'Délai dépassé. Le serveur n\'a pas reçu le code WhatsApp. Réessayez.' });
     }
-  }, 35000);
+  }, 50000);
 
   try {
     // Ensure socket is initialized
     if (!socket) {
-      console.log('🔧 Socket not ready, initializing...');
+      console.log('🔧 Socket not initialized, starting initialization...');
       await initializeSocket();
     }
 
-    // Wait for socket to be ready (max 15 seconds)
-    let waitCount = 0;
-    while (!socketReady.ready && waitCount < 30) {
-      await delay(500);
-      waitCount++;
-    }
+    // Wait for socket to be ready (45 seconds max)
+    const isReady = await waitForSocketReady(45000);
 
-    if (!socketReady.ready) {
+    if (!isReady) {
       clearTimeout(timeoutId);
       responseSent = true;
-      console.log('❌ Socket not ready after 15 seconds');
-      return res.json({ error: 'Le service de pairage n\'est pas prêt. Réessayez dans 10 secondes.' });
+      console.log('❌ Socket not ready after waiting');
+      return res.json({ error: 'Le service de pairage met du temps à se connecter. Veuillez réessayer.' });
     }
 
     console.log('✅ Socket ready, requesting pairing code...');
@@ -571,6 +611,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     socketReady: socketReady.ready,
+    socketInitializing: socketInitializing,
     uptime: process.uptime()
   });
 });
@@ -650,5 +691,5 @@ process.on('uncaughtException', (error) => {
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('❌ Unhandled Rejection:', reason);
 });
