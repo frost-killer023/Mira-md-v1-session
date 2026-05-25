@@ -16,12 +16,11 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // ═════════════════════════════════════════════════════════════════
-// GLOBAL STABLE SOCKET INSTANCE (Prevent multiple instances)
+// GLOBAL VARIABLES
 // ═════════════════════════════════════════════════════════════════
 let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
-let qrCode = null;
 
 // Logger configuration
 const logger = pino({ level: 'silent' });
@@ -30,7 +29,7 @@ const logger = pino({ level: 'silent' });
 const sessionPath = path.join(__dirname, 'session');
 
 // ═════════════════════════════════════════════════════════════════
-// ENSURE SESSION DIRECTORY EXISTS (with proper error handling)
+// ENSURE SESSION DIRECTORY EXISTS
 // ═════════════════════════════════════════════════════════════════
 async function ensureSessionDirectory() {
   try {
@@ -44,107 +43,130 @@ async function ensureSessionDirectory() {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// INITIALIZE STABLE SOCKET ON SERVER START
+// INITIALIZE WHATSAPP SOCKET WITH PROPER CONNECTION HANDLING
 // ═════════════════════════════════════════════════════════════════
 async function initializeSocket() {
   if (socket && socketReady.ready) {
-    console.log('🔄 Socket already exists and ready, skipping re-initialization');
+    console.log('🔄 Socket already ready, skipping re-initialization');
     return socket;
   }
 
   if (socketInitializing) {
     console.log('⏳ Socket initialization already in progress...');
-    await delay(1000);
-    return socket;
+    return null;
   }
 
   socketInitializing = true;
   console.log('🚀 Initializing WhatsApp socket...');
 
   try {
-    // Load or create authentication state from file system
+    // Load or create authentication state
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-    console.log('🔐 Auth state loaded from ./session');
+    console.log('🔐 Auth state loaded');
 
-    // Create socket instance with proper configuration
+    // Create socket with optimized config
     socket = makeWASocket({
       auth: state,
       printQRInTerminal: false,
       logger: logger,
       browser: ['MIRA-BOT', 'Chrome', '125.0.0.0'],
       syncFullHistory: false,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       emitOwnEventsOnReceive: false,
       shouldCacheMessages: false,
       generateHighQualityLinkPreview: false,
       retryRequestDelayMs: 100,
-      maxRetries: 3
+      maxRetries: 3,
+      version: [2, 2333, 8]
     });
 
-    console.log('✅ Socket created successfully');
+    console.log('✅ Socket created');
 
-    // Auto-save credentials on update
+    // Save credentials when updated
     socket.ev.on('creds.update', saveCreds);
-    console.log('💾 Credential auto-save enabled');
+
+    // Track connection state
+    let connectionTimeout;
 
     // Handle connection updates
-    socket.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr: qrUpdate } = update;
-
-      if (qrUpdate) {
-        qrCode = qrUpdate;
-        console.log('📲 QR Code received - scan with WhatsApp');
-      }
+    socket.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
       if (connection === 'connecting') {
         console.log('🔌 Connecting to WhatsApp...');
+        // Reset timeout on each connection attempt
+        if (connectionTimeout) clearTimeout(connectionTimeout);
+        connectionTimeout = setTimeout(() => {
+          if (!socketReady.ready) {
+            console.log('⏱️ Connection attempt timeout');
+            socket.end(new Error('Connection timeout'));
+          }
+        }, 30000);
       }
 
       if (connection === 'open') {
+        if (connectionTimeout) clearTimeout(connectionTimeout);
         socketReady.ready = true;
-        qrCode = null;
-        console.log('🟢 WhatsApp socket connected successfully');
+        socketInitializing = false;
+        console.log('🟢 WhatsApp socket connected!');
         if (socket.user && socket.user.id) {
-          console.log(`👤 User JID: ${socket.user.id}`);
+          console.log(`👤 User: ${socket.user.id}`);
         }
       }
 
       if (connection === 'close') {
+        if (connectionTimeout) clearTimeout(connectionTimeout);
         socketReady.ready = false;
+        
         const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
 
         if (shouldReconnect) {
-          console.log('🔄 Connection closed, will retry on next request...');
+          console.log('🔄 Reconnecting...');
           socket = null;
           socketInitializing = false;
         } else {
-          console.log('❌ Connection closed: Logged out');
+          console.log('❌ Logged out');
           socket = null;
           socketInitializing = false;
         }
       }
+
+      if (qr) {
+        console.log('📲 QR Code available');
+      }
     });
 
-    // Handle disconnections
+    // Handle errors
     socket.ev.on('connection.error', (error) => {
       console.error('❌ Connection error:', error.message);
     });
 
-    console.log('📡 Socket event listeners registered');
-    socketInitializing = false;
-    return socket;
+    console.log('📡 Event listeners registered');
 
   } catch (error) {
     socketInitializing = false;
-    console.error('❌ Error initializing socket:', error.message);
+    console.error('❌ Socket error:', error.message);
     socket = null;
     throw error;
   }
 }
 
 // ═════════════════════════════════════════════════════════════════
-// FRONTEND - Glassmorphism UI with Status
+// WAIT FOR SOCKET READY
+// ═════════════════════════════════════════════════════════════════
+async function waitForSocketReady(maxWait = 90000) {
+  const startTime = Date.now();
+  
+  while (!socketReady.ready && (Date.now() - startTime) < maxWait) {
+    await delay(500);
+  }
+  
+  return socketReady.ready;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// FRONTEND - STATUS UI
 // ═════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.send(`
@@ -158,7 +180,12 @@ app.get('/', (req, res) => {
       <style>
         :root {
           --gradient-btn: linear-gradient(135deg, #5b7fff 0%, #9053cd 100%);
-          --bg-dark: #0a0e1a;
+        }
+
+        * {
+          margin: 0;
+          padding: 0;
+          box-sizing: border-box;
         }
 
         body {
@@ -172,15 +199,12 @@ app.get('/', (req, res) => {
           justify-content: center;
           align-items: center;
           min-height: 100vh;
-          margin: 0;
           padding: 20px;
-          box-sizing: border-box;
         }
 
         .card {
           background: rgba(255, 255, 255, 0.03);
           backdrop-filter: blur(20px);
-          -webkit-backdrop-filter: blur(20px);
           border: 1px solid rgba(255, 255, 255, 0.08);
           padding: 40px 30px;
           border-radius: 28px;
@@ -198,7 +222,7 @@ app.get('/', (req, res) => {
           display: flex;
           justify-content: center;
           align-items: center;
-          margin: 0 auto 25px auto;
+          margin: 0 auto 25px;
           box-shadow: 0 8px 20px rgba(144, 83, 205, 0.2);
         }
 
@@ -215,7 +239,7 @@ app.get('/', (req, res) => {
         h1 {
           font-size: 26px;
           font-weight: 700;
-          margin: 0 0 8px 0;
+          margin-bottom: 8px;
           letter-spacing: 0.5px;
           background: linear-gradient(135deg, #fff 60%, #dcd0ff 100%);
           -webkit-background-clip: text;
@@ -225,8 +249,38 @@ app.get('/', (req, res) => {
         .subtitle {
           font-size: 14px;
           color: #7e8ca4;
-          margin-bottom: 35px;
-          font-weight: 400;
+          margin-bottom: 25px;
+        }
+
+        .status-box {
+          padding: 12px 16px;
+          background: rgba(91, 127, 255, 0.1);
+          border: 1px solid rgba(91, 127, 255, 0.3);
+          border-radius: 12px;
+          font-size: 12px;
+          color: #a4b3cd;
+          margin-bottom: 20px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .status-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: #fbbf24;
+          animation: pulse 2s infinite;
+        }
+
+        .status-dot.ready {
+          background: #4ade80;
+          animation: none;
+        }
+
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
         }
 
         .input-label {
@@ -234,14 +288,13 @@ app.get('/', (req, res) => {
           font-size: 12px;
           font-weight: 600;
           text-transform: uppercase;
-          letter-spacing: 1px;
           color: #8fa0be;
           margin-bottom: 8px;
           display: block;
           padding-left: 4px;
         }
 
-        input[type="text"] {
+        input {
           width: 100%;
           padding: 16px 20px;
           background: rgba(255, 255, 255, 0.04);
@@ -249,12 +302,11 @@ app.get('/', (req, res) => {
           border-radius: 14px;
           color: #fff;
           font-size: 16px;
-          box-sizing: border-box;
-          margin-bottom: 20px;
+          margin-bottom: 16px;
           transition: 0.3s;
         }
 
-        input[type="text"]:focus {
+        input:focus {
           outline: none;
           border-color: #8063f5;
           background: rgba(255, 255, 255, 0.07);
@@ -280,10 +332,9 @@ app.get('/', (req, res) => {
           margin-bottom: 15px;
         }
 
-        button:hover {
+        button:hover:not(:disabled) {
           opacity: 0.95;
           transform: translateY(-1px);
-          box-shadow: 0 12px 24px rgba(114, 107, 243, 0.3);
         }
 
         button:disabled {
@@ -291,46 +342,14 @@ app.get('/', (req, res) => {
           cursor: not-allowed;
         }
 
-        .status-box {
-          padding: 12px 16px;
-          background: rgba(91, 127, 255, 0.1);
-          border: 1px solid rgba(91, 127, 255, 0.3);
-          border-radius: 12px;
-          font-size: 12px;
-          color: #a4b3cd;
-          margin-bottom: 15px;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-
-        .status-dot {
-          width: 8px;
-          height: 8px;
-          border-radius: 50%;
-          background: #5b7fff;
-          animation: pulse 2s infinite;
-        }
-
-        .status-dot.ready {
-          background: #4ade80;
-          animation: none;
-        }
-
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-
         .result-box {
-          margin-top: 15px;
           border: 1px dashed rgba(255, 255, 255, 0.15);
           border-radius: 16px;
           padding: 20px;
           font-size: 14px;
           color: #a4b3cd;
           background: rgba(0, 0, 0, 0.1);
-          min-height: 40px;
+          min-height: 50px;
           display: flex;
           flex-direction: column;
           justify-content: center;
@@ -338,19 +357,20 @@ app.get('/', (req, res) => {
         }
 
         .code-output {
-          font-size: 32px;
+          font-size: 36px;
           font-weight: 700;
           color: #fff;
           letter-spacing: 4px;
-          margin: 10px 0;
-          text-shadow: 0 0 20px rgba(255,255,255,0.4);
+          margin: 12px 0;
+          text-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
+          font-family: 'Courier New', monospace;
         }
 
         .loader {
           display: none;
-          width: 24px;
-          height: 24px;
-          border: 3px solid rgba(255,255,255,0.2);
+          width: 20px;
+          height: 20px;
+          border: 3px solid rgba(255, 255, 255, 0.2);
           border-top-color: #fff;
           border-radius: 50%;
           animation: spin 0.8s linear infinite;
@@ -362,7 +382,6 @@ app.get('/', (req, res) => {
       </style>
     </head>
     <body>
-
       <div class="card">
         <div class="icon-container">
           <svg viewBox="0 0 24 24">
@@ -372,18 +391,18 @@ app.get('/', (req, res) => {
         </div>
 
         <h1>MIRA-BOT-V1</h1>
-        <div class="subtitle">Générateur de Code de Pairage</div>
+        <div class="subtitle">Générateur de Code de Pairage WhatsApp</div>
 
         <div class="status-box">
           <div class="status-dot" id="statusDot"></div>
-          <span id="statusLabel">Connexion en cours...</span>
+          <span id="statusLabel">Initialisation...</span>
         </div>
 
         <form id="pairingForm">
           <label class="input-label">Numéro de téléphone</label>
-          <input type="text" id="phoneNumber" placeholder="Ex: 25766486303" required>
+          <input type="text" id="phoneNumber" placeholder="25766486303" required>
           
-          <button type="submit" id="submitBtn">
+          <button type="submit" id="submitBtn" disabled>
             <svg style="width:18px; height:18px; fill:currentColor;" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
             <span id="btnText">Générer le Code</span>
           </button>
@@ -391,12 +410,11 @@ app.get('/', (req, res) => {
 
         <div class="result-box" id="resultBox">
           <div class="loader" id="loader"></div>
-          <span id="statusText">Entrez votre numéro pour générer le code</span>
+          <span id="statusText">En attente du service...</span>
         </div>
       </div>
 
       <script>
-        // Check server status
         async function checkStatus() {
           try {
             const response = await fetch('/health');
@@ -409,42 +427,33 @@ app.get('/', (req, res) => {
               dot.classList.add('ready');
               label.textContent = '✅ Service prêt';
               btn.disabled = false;
-            } else if (data.socketInitializing) {
-              dot.classList.remove('ready');
-              label.textContent = '🔌 Initialisation en cours...';
-              btn.disabled = true;
+              document.getElementById('statusText').textContent = 'Entrez votre numéro';
             } else {
               dot.classList.remove('ready');
-              label.textContent = '⏳ En attente...';
-              btn.disabled = false;
+              label.textContent = data.socketInitializing ? '🔌 Connexion...' : '⏳ En attente...';
+              btn.disabled = true;
             }
           } catch (err) {
-            document.getElementById('statusLabel').textContent = '❌ Erreur de connexion';
+            document.getElementById('statusLabel').textContent = '❌ Erreur serveur';
           }
         }
 
-        // Check status every 2 seconds
         checkStatus();
         setInterval(checkStatus, 2000);
 
         document.getElementById('pairingForm').addEventListener('submit', async (e) => {
           e.preventDefault();
+          
           const num = document.getElementById('phoneNumber').value.replace(/[^0-9]/g, '');
-          const loader = document.getElementById('loader');
-          const statusText = document.getElementById('statusText');
-          const submitBtn = document.getElementById('submitBtn');
-          const btnText = document.getElementById('btnText');
-          const resultBox = document.getElementById('resultBox');
-
           if (!num || num.length < 10) {
-            statusText.innerHTML = "<span style='color: #ff5b5b;'>Entrez un numéro valide</span>";
+            document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">Numéro invalide!</span>';
             return;
           }
 
-          submitBtn.disabled = true;
-          loader.style.display = "block";
-          statusText.style.display = "none";
-          btnText.innerText = "Génération...";
+          document.getElementById('submitBtn').disabled = true;
+          document.getElementById('loader').style.display = 'block';
+          document.getElementById('statusText').style.display = 'none';
+          document.getElementById('btnText').textContent = 'Génération...';
 
           try {
             const response = await fetch('/pair', {
@@ -454,28 +463,28 @@ app.get('/', (req, res) => {
             });
             const data = await response.json();
 
-            loader.style.display = "none";
-            statusText.style.display = "block";
-            submitBtn.disabled = false;
-            btnText.innerText = "Générer le Code";
+            document.getElementById('loader').style.display = 'none';
+            document.getElementById('statusText').style.display = 'block';
+            document.getElementById('submitBtn').disabled = false;
+            document.getElementById('btnText').textContent = 'Générer le Code';
 
             if (data.code) {
-              resultBox.style.borderStyle = "solid";
-              resultBox.style.borderColor = "rgba(144, 83, 205, 0.4)";
-              statusText.innerHTML = \`
-                <span style="color: #a4b3cd; font-size: 12px;">VOTRE CODE DE PAIRAGE WHATSAPP :</span>
+              const resultBox = document.getElementById('resultBox');
+              resultBox.style.borderColor = 'rgba(144, 83, 205, 0.5)';
+              document.getElementById('statusText').innerHTML = \`
+                <span style="color: #a4b3cd; font-size: 11px;">CODE DE PAIRAGE:</span>
                 <div class="code-output">\${data.code}</div>
-                <span style="font-size: 12px; line-height: 1.4; display:block; margin-top:5px;">Ouvrez la notification WhatsApp sur votre téléphone et entrez ce code pour lier votre compte.</span>
+                <span style="font-size: 11px; margin-top: 8px;">Entrez ce code dans WhatsApp</span>
               \`;
             } else {
-              statusText.innerHTML = "<span style='color: #ff5b5b;'>Erreur: " + (data.error || "Erreur inconnue") + "</span>";
+              document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">' + (data.error || 'Erreur') + '</span>';
             }
           } catch (err) {
-            loader.style.display = "none";
-            statusText.style.display = "block";
-            submitBtn.disabled = false;
-            btnText.innerText = "Générer le Code";
-            statusText.innerHTML = "<span style='color: #ff5b5b;'>Échec de connexion au serveur de pairage.</span>";
+            document.getElementById('loader').style.display = 'none';
+            document.getElementById('statusText').style.display = 'block';
+            document.getElementById('submitBtn').disabled = false;
+            document.getElementById('btnText').textContent = 'Générer le Code';
+            document.getElementById('statusText').innerHTML = '<span style="color: #ff5b5b;">Erreur de connexion</span>';
           }
         });
       </script>
@@ -490,131 +499,103 @@ app.get('/', (req, res) => {
 app.post('/pair', async (req, res) => {
   const phoneNumber = req.body.number;
 
-  // Validate phone number
   if (!phoneNumber || !/^\d{10,}$/.test(phoneNumber)) {
-    console.log('❌ Invalid phone number format:', phoneNumber);
-    return res.status(400).json({ 
-      error: 'Format invalide. Utilisez un numéro sans espaces ni caractères spéciaux.' 
-    });
+    return res.json({ error: 'Numéro invalide' });
   }
 
-  console.log(`📱 Pair request for number: ${phoneNumber}`);
+  console.log(`\n📱 Pairing request: ${phoneNumber}`);
 
   try {
-    // Initialize socket if not already done
+    // Initialize socket if needed
     if (!socket) {
-      console.log('🔧 Socket not initialized, initializing...');
+      console.log('→ Socket nécessaire, initialisation...');
       await initializeSocket();
     }
 
-    // Wait for socket to be ready (up to 60 seconds)
-    let attempts = 0;
-    while (!socketReady.ready && attempts < 60) {
-      console.log(`⏳ Waiting for socket... (${attempts + 1}/60)`);
-      await delay(1000);
-      attempts++;
+    // Wait for connection (max 90 seconds)
+    console.log('→ Attente connexion WhatsApp...');
+    const isReady = await waitForSocketReady(90000);
+
+    if (!isReady) {
+      console.log('✗ Socket non prêt après 90s');
+      return res.json({ error: 'WhatsApp n\'a pas répondu. Vérifiez votre connexion Internet.' });
     }
 
-    if (!socketReady.ready) {
-      console.log('❌ Socket not ready after 60 seconds');
-      return res.json({ error: 'Le service ne peut pas se connecter à WhatsApp. Réessayez dans 30 secondes.' });
+    console.log('→ Socket connecté, demande du code...');
+
+    // Request pairing code
+    let pairingCode;
+    try {
+      pairingCode = await socket.requestPairingCode(phoneNumber);
+    } catch (err) {
+      console.error('✗ Code error:', err.message);
+      return res.json({ error: 'Impossible de générer le code. Réessayez.' });
     }
 
-    console.log('✅ Socket ready, requesting pairing code...');
+    console.log(`✓ Code généré: ${pairingCode}\n`);
 
-    // Request pairing code from WhatsApp
-    const pairingCode = await socket.requestPairingCode(phoneNumber);
-
-    console.log(`✅ Pairing code generated: ${pairingCode}`);
-
-    // Send pairing code to frontend
+    // Return code immediately
     res.json({ code: pairingCode });
 
-    // Wait for connection after pairing code is accepted
-    console.log('⏳ Waiting for WhatsApp connection confirmation...');
-    
-    let connectionConfirmed = false;
-    const connectionTimeout = setTimeout(() => {
-      if (!connectionConfirmed) {
-        console.log('⚠️ Connection confirmation timeout');
-      }
-    }, 120000); // 2 minutes
+    // Handle post-pairing connection in background
+    setTimeout(() => {
+      const handlePostConnection = (update) => {
+        const { connection } = update;
+        
+        if (connection === 'open') {
+          console.log('→ Utilisateur connecté, envoi confirmation...');
+          socket.ev.removeListener('connection.update', handlePostConnection);
+          
+          try {
+            const sessionId = Buffer.from(
+              JSON.stringify({
+                phoneNumber: socket.user?.id || 'unknown',
+                timestamp: new Date().toISOString(),
+                bot: 'MIRA-BOT-V1'
+              })
+            ).toString('base64');
 
-    // Listen for successful connection
-    const handleConnection = async (update) => {
-      const { connection } = update;
-
-      if (connection === 'open' && !connectionConfirmed) {
-        connectionConfirmed = true;
-        clearTimeout(connectionTimeout);
-        socket.ev.removeListener('connection.update', handleConnection);
-
-        console.log('🟢 WhatsApp connection confirmed!');
-        await delay(2000);
-
-        try {
-          // Generate Session ID from credentials
-          const creds = socket.authState.creds;
-          const sessionData = {
-            phoneNumber: creds.me?.id || 'unknown',
-            timestamp: new Date().toISOString(),
-            bot: 'MIRA-BOT-V1'
-          };
-          const sessionId = Buffer.from(JSON.stringify(sessionData)).toString('base64');
-
-          // Send confirmation message
-          const messageText = `╭───────────────────⬣
+            const msg = `╭───────────────────⬣
 │ 🤖 *MIRA BOT V1*
 │ 
 │ ✅ Connexion Réussie
 │ Session ID:
 │ \`\`\`
-│ \${sessionId}
+│ ${sessionId}
 │ \`\`\`
 │ 
-│ 📱 WhatsApp Linked Device Actif
+│ 📱 WhatsApp Linked Device
 │ ⚡ Système Opérationnel
 ╰───────────────────⬣`;
 
-          await socket.sendMessage(socket.user.id, { text: messageText });
-          console.log('✅ Confirmation message sent');
-
-        } catch (error) {
-          console.error('⚠️ Error sending confirmation message:', error.message);
+            socket.sendMessage(socket.user.id, { text: msg })
+              .then(() => console.log('✓ Confirmation envoyée\n'))
+              .catch(e => console.error('⚠ Envoi failed:', e.message));
+          } catch (error) {
+            console.error('⚠ Erreur confirmation:', error.message);
+          }
         }
+      };
 
-        console.log('💾 Session saved and active');
-      }
-    };
-
-    socket.ev.on('connection.update', handleConnection);
+      socket.ev.on('connection.update', handlePostConnection);
+      
+      setTimeout(() => {
+        socket.ev.removeListener('connection.update', handlePostConnection);
+      }, 120000);
+    }, 100);
 
   } catch (error) {
-    console.error('❌ Pairing error:', error.message);
-
-    // Return user-friendly error message
-    let errorMessage = 'Erreur du service de pairage';
-    
-    if (error.message.includes('Invalid pairing code')) {
-      errorMessage = 'Code de pairage invalide. Vérifiez que vous avez saisi le bon numéro.';
-    } else if (error.message.includes('timeout') || error.message.includes('Timeout')) {
-      errorMessage = 'WhatsApp a mis trop de temps à répondre. Réessayez.';
-    } else if (error.message.includes('connection') || error.message.includes('Connection')) {
-      errorMessage = 'Impossible de se connecter à WhatsApp. Vérifiez votre connexion Internet.';
-    } else if (error.message.includes('network')) {
-      errorMessage = 'Erreur réseau. Réessayez dans quelques secondes.';
-    }
-
-    res.json({ error: errorMessage });
+    console.error('✗ Erreur:', error.message);
+    res.json({ error: 'Erreur du service. Réessayez.' });
   }
 });
 
 // ═════════════════════════════════════════════════════════════════
-// HEALTH CHECK ENDPOINT
+// HEALTH CHECK
 // ═════════════════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({ 
-    status: 'ok', 
+    status: 'ok',
     socketReady: socketReady.ready,
     socketInitializing: socketInitializing,
     uptime: process.uptime()
@@ -622,79 +603,54 @@ app.get('/health', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SERVER INITIALIZATION & START
+// START SERVER
 // ═════════════════════════════════════════════════════════════════
 async function startServer() {
   try {
-    // Ensure session directory exists
-    const sessionDirReady = await ensureSessionDirectory();
-    if (!sessionDirReady) {
-      console.warn('⚠️ Session directory creation had issues, but continuing...');
-    }
+    await ensureSessionDirectory();
 
-    // Start the Express server
     app.listen(PORT, () => {
-      console.log('');
-      console.log('╔════════════════════════════════════════╗');
-      console.log('║  🚀 MIRA-BOT-V1 SERVER STARTED');
+      console.log('\n╔════════════════════════════════════════╗');
+      console.log('║  🚀 MIRA-BOT-V1 DÉMARRÉ');
       console.log(`║  🌐 Port: ${PORT}`);
-      console.log('║  📱 WhatsApp Pairing System: READY');
-      console.log('║  💾 Session Storage: ./session');
-      console.log('║  🟢 Status: ONLINE');
-      console.log('╚════════════════════════════════════════╝');
-      console.log('');
+      console.log('║  📱 WhatsApp Pairing System');
+      console.log('║  💾 Session: ./session');
+      console.log('╚════════════════════════════════════════╝\n');
     });
 
-    // Initialize socket in background
+    // Start socket initialization
     initializeSocket().catch(err => {
-      console.error('⚠️ Initial socket initialization failed:', err.message);
-      console.log('💡 Socket will initialize on first pairing request');
+      console.error('⚠ Socket init failed:', err.message);
     });
 
   } catch (error) {
-    console.error('❌ Fatal error during server startup:', error.message);
+    console.error('❌ Fatal:', error.message);
     process.exit(1);
   }
 }
 
-// Start the server
 startServer();
 
 // ═════════════════════════════════════════════════════════════════
 // GRACEFUL SHUTDOWN
 // ═════════════════════════════════════════════════════════════════
 process.on('SIGTERM', () => {
-  console.log('📛 SIGTERM received, shutting down gracefully...');
-  if (socket) {
-    try {
-      socket.end(new Error('Server shutting down'));
-    } catch (error) {
-      console.error('Error closing socket:', error.message);
-    }
-  }
+  console.log('\n📛 Shutdown signal');
+  if (socket) socket.end(new Error('Server stopping'));
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('📛 SIGINT received, shutting down gracefully...');
-  if (socket) {
-    try {
-      socket.end(new Error('Server shutting down'));
-    } catch (error) {
-      console.error('Error closing socket:', error.message);
-    }
-  }
+  console.log('\n📛 Interrupt signal');
+  if (socket) socket.end(new Error('Server stopping'));
   process.exit(0);
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error.message);
-  console.error(error.stack);
+  console.error('❌ Uncaught:', error.message);
   process.exit(1);
 });
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection:', reason);
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled:', reason);
 });
