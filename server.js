@@ -15,9 +15,9 @@ const PORT = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 // GLOBAL STABLE SOCKET INSTANCE (Prevent multiple instances)
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
@@ -25,15 +25,26 @@ const socketReady = { ready: false };
 // Logger configuration
 const logger = pino({ level: 'silent' });
 
-// Ensure session directory exists
+// Session path setup
 const sessionPath = path.join(__dirname, 'session');
-await fs.mkdir(sessionPath, { recursive: true }).catch(() => {});
 
-console.log(`📁 Session directory: ${sessionPath}`);
+// ═════════════════════════════════════════════════════════════════
+// ENSURE SESSION DIRECTORY EXISTS (with proper error handling)
+// ═════════════════════════════════════════════════════════════════
+async function ensureSessionDirectory() {
+  try {
+    await fs.mkdir(sessionPath, { recursive: true });
+    console.log(`📁 Session directory ready: ${sessionPath}`);
+    return true;
+  } catch (error) {
+    console.error('⚠️ Failed to create session directory:', error.message);
+    return false;
+  }
+}
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 // INITIALIZE STABLE SOCKET ON SERVER START
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 async function initializeSocket() {
   if (socket) {
     console.log('🔄 Socket already exists, skipping re-initialization');
@@ -88,7 +99,9 @@ async function initializeSocket() {
       if (connection === 'open') {
         socketReady.ready = true;
         console.log('🟢 WhatsApp socket connected successfully');
-        console.log(`👤 User JID: ${socket.user.id}`);
+        if (socket.user && socket.user.id) {
+          console.log(`👤 User JID: ${socket.user.id}`);
+        }
       }
 
       if (connection === 'close') {
@@ -99,7 +112,10 @@ async function initializeSocket() {
           console.log('🔄 Connection closed, attempting to reconnect...');
           setTimeout(() => {
             socket = null;
-            initializeSocket();
+            socketInitializing = false;
+            initializeSocket().catch(err => {
+              console.error('🔄 Reconnection attempt failed:', err.message);
+            });
           }, 3000);
         } else {
           console.log('❌ Connection closed: Logged out or invalid session');
@@ -130,14 +146,9 @@ async function initializeSocket() {
   }
 }
 
-// Start socket on server startup
-initializeSocket().catch(err => {
-  console.error('⚠️ Initial socket initialization failed:', err.message);
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// FRONTEND - Glassmorphism UI (UNCHANGED)
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
+// FRONTEND - Glassmorphism UI
+// ═════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -408,9 +419,9 @@ app.get('/', (req, res) => {
   `);
 });
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 // PAIRING CODE ENDPOINT - FIXED & STABLE
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 app.post('/pair', async (req, res) => {
   const phoneNumber = req.body.number;
 
@@ -495,7 +506,7 @@ app.post('/pair', async (req, res) => {
           // Generate Session ID from credentials
           const creds = socket.authState.creds;
           const sessionData = {
-            phoneNumber: creds.me.id,
+            phoneNumber: creds.me?.id || 'unknown',
             timestamp: new Date().toISOString(),
             bot: 'MIRA-BOT-V1'
           };
@@ -553,26 +564,67 @@ app.post('/pair', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// SERVER START
-// ═══════════════════════════════════════════════════════════════════════
-app.listen(PORT, () => {
-  console.log('');
-  console.log('╔════════════════════════════════════════╗');
-  console.log('║  🚀 MIRA-BOT-V1 SERVER STARTED');
-  console.log(\`║  🌐 Port: \${PORT}\`);
-  console.log('║  📱 WhatsApp Pairing System: READY');
-  console.log('║  💾 Session Storage: ./session');
-  console.log('║  🟢 Status: ONLINE');
-  console.log('╚════════════════════════════════════════╝');
-  console.log('');
+// ═════════════════════════════════════════════════════════════════
+// HEALTH CHECK ENDPOINT (pour monitoring)
+// ═════════════════════════════════════════════════════════════════
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    socketReady: socketReady.ready,
+    uptime: process.uptime()
+  });
 });
 
-// Graceful shutdown
+// ═════════════════════════════════════════════════════════════════
+// SERVER INITIALIZATION & START
+// ═════════════════════════════════════════════════════════════════
+async function startServer() {
+  try {
+    // Ensure session directory exists
+    const sessionDirReady = await ensureSessionDirectory();
+    if (!sessionDirReady) {
+      console.warn('⚠️ Session directory creation had issues, but continuing...');
+    }
+
+    // Start the Express server
+    app.listen(PORT, () => {
+      console.log('');
+      console.log('╔════════════════════════════════════════╗');
+      console.log('║  🚀 MIRA-BOT-V1 SERVER STARTED');
+      console.log(`║  🌐 Port: ${PORT}`);
+      console.log('║  📱 WhatsApp Pairing System: READY');
+      console.log('║  💾 Session Storage: ./session');
+      console.log('║  🟢 Status: ONLINE');
+      console.log('╚════════════════════════════════════════╝');
+      console.log('');
+    });
+
+    // Initialize socket in background (don't wait)
+    initializeSocket().catch(err => {
+      console.error('⚠️ Initial socket initialization failed:', err.message);
+      console.log('💡 Socket will retry on first pairing request');
+    });
+
+  } catch (error) {
+    console.error('❌ Fatal error during server startup:', error.message);
+    process.exit(1);
+  }
+}
+
+// Start the server
+startServer();
+
+// ═════════════════════════════════════════════════════════════════
+// GRACEFUL SHUTDOWN
+// ═════════════════════════════════════════════════════════════════
 process.on('SIGTERM', () => {
   console.log('📛 SIGTERM received, shutting down gracefully...');
   if (socket) {
-    socket.end(new Error('Server shutting down'));
+    try {
+      socket.end(new Error('Server shutting down'));
+    } catch (error) {
+      console.error('Error closing socket:', error.message);
+    }
   }
   process.exit(0);
 });
@@ -580,7 +632,23 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   console.log('📛 SIGINT received, shutting down gracefully...');
   if (socket) {
-    socket.end(new Error('Server shutting down'));
+    try {
+      socket.end(new Error('Server shutting down'));
+    } catch (error) {
+      console.error('Error closing socket:', error.message);
+    }
   }
   process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error.message);
+  console.error(error.stack);
+  process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
