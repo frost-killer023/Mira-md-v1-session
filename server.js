@@ -1,6 +1,6 @@
 import express from 'express';
 import baileys from '@whiskeysockets/baileys';
-const { default: makeWASocket, useMultiFileAuthState, delay, disconnectReason } = baileys;
+const { default: makeWASocket, useMultiFileAuthState, delay } = baileys;
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
@@ -281,82 +281,83 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Logique de génération optimisée pour Linux / Render
+// Logique simplifiée au maximum pour éliminer tout bug Linux/Render
 app.post('/pair', async (req, res) => {
     let phoneNumber = req.body.number;
     if (!phoneNumber) return res.status(400).json({ error: "Numéro manquant" });
 
-    // Dossier temporaire unique
+    // Nettoyage forcé des anciens dossiers de sessions pour éviter les verrous système
     const sessionDir = path.join(__dirname, 'session_' + phoneNumber);
-    
-    try {
-        if (fs.existsSync(sessionDir)) {
-            fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-    } catch(e) {}
+    if (fs.existsSync(sessionDir)) {
+        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
+    }
 
     try {
+        // Initialisation de l'authentification multi-fichiers
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         
+        // Configuration de base sans fioritures (évite le crash lié aux options avancées)
         const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'fatal' }), // Évite de surcharger les logs Render
-            browser: ["Chrome (Linux)", "Chrome", "124.0.0.0"] // Simulation d'un navigateur standard stable
+            logger: pino({ level: 'fatal' }),
+            browser: ["Mac OS", "Chrome", "124.0.0.0"]
         });
 
-        // Attente de l'initialisation interne avant demande de code
-        await delay(3000);
-
-        try {
-            let code = await sock.requestPairingCode(phoneNumber);
-            if (!res.headersSent) {
-                res.json({ code: code });
+        // Demande directe du code de pairage après une attente de sécurité minimale
+        setTimeout(async () => {
+            try {
+                let code = await sock.requestPairingCode(phoneNumber);
+                if (!res.headersSent) {
+                    return res.json({ code: code });
+                }
+            } catch (err) {
+                console.error("Erreur lors de la demande du code :", err);
+                if (!res.headersSent) {
+                    return res.json({ error: "WhatsApp refuse la demande. Vérifie le format du numéro." });
+                }
             }
-        } catch (err) {
-            console.error(err);
-            if (!res.headersSent) return res.json({ error: "Génération du code refusée par WhatsApp. Réessaye." });
-        }
+        }, 3000);
 
+        // Capture de l'ouverture de session réussie
         sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
+            const { connection } = update;
 
             if (connection === 'open') {
                 await delay(5000);
-                
                 try {
-                    const credsFile = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf-8'));
-                    const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
-                    const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
+                    // Lecture sécurisée du creds.json généré
+                    const credsPath = path.join(sessionDir, 'creds.json');
+                    if (fs.existsSync(credsPath)) {
+                        const credsFile = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+                        const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
+                        const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
 
-                    const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur Render ou via GitHub Actions :\n\n${finalSessionId}`;
+                        const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur ton bot :\n\n${finalSessionId}`;
 
-                    await sock.sendMessage(sock.user.id, { text: successMessage });
-                } catch(e) {
-                    console.log("Erreur lors de l'envoi du message de session ID: ", e);
+                        await sock.sendMessage(sock.user.id, { text: successMessage });
+                    }
+                } catch (e) {
+                    console.error("Erreur d'écriture/envoi de session :", e);
                 }
-                
+
+                // Déconnexion et nettoyage propre
                 await delay(2000);
-                try { sock.logout(); } catch(e) {}
-                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-            }
-
-            if (connection === 'close') {
-                const reason = lastDisconnect?.error?.output?.statusCode;
-                if (reason !== disconnectReason.loggedOut) {
-                    // Gère les fermetures silencieuses
-                }
+                try { sock.logout(); } catch(e){}
+                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
 
     } catch (error) {
-        console.error("Global error in /pair:", error);
-        if (!res.headersSent) res.json({ error: "Le serveur a rencontré un problème d'initialisation." });
+        console.error("Crash d'initialisation Baileys :", error);
+        if (!res.headersSent) {
+            res.json({ error: "Problème temporaire d'allocation des dossiers sur le serveur." });
+        }
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 stabilisé en ligne sur le port ${PORT}`);
+    console.log(`Serveur MIRA-BOT-V1 prêt et allégé sur le port ${PORT}`);
 });
