@@ -22,16 +22,8 @@ let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
 
-// Logger with more details
-const logger = pino({ 
-  level: 'debug',
-  transport: {
-    target: 'pino-pretty',
-    options: {
-      colorize: true
-    }
-  }
-});
+// Logger - SILENT ONLY
+const logger = pino({ level: 'silent' });
 
 // Session path setup
 const sessionPath = path.join(__dirname, 'session');
@@ -74,7 +66,7 @@ async function initializeSocket() {
     socket = makeWASocket({
       auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }),
+      logger: logger,
       browser: ['MIRA-BOT', 'Chrome', '125.0.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
