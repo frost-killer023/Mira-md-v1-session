@@ -4,10 +4,7 @@ const { default: makeWASocket, useMultiFileAuthState, delay } = baileys;
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import os from 'os';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -281,30 +278,29 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Logique simplifiée au maximum pour éliminer tout bug Linux/Render
+// Logique utilisant le dossier système /tmp (autorisé sur Render)
 app.post('/pair', async (req, res) => {
     let phoneNumber = req.body.number;
     if (!phoneNumber) return res.status(400).json({ error: "Numéro manquant" });
 
-    // Nettoyage forcé des anciens dossiers de sessions pour éviter les verrous système
-    const sessionDir = path.join(__dirname, 'session_' + phoneNumber);
+    // Utilisation du dossier /tmp du système d'exploitation Linux
+    const sessionDir = path.join(os.tmpdir(), 'mira_sess_' + phoneNumber);
+
     if (fs.existsSync(sessionDir)) {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
     }
 
     try {
-        // Initialisation de l'authentification multi-fichiers
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         
-        // Configuration de base sans fioritures (évite le crash lié aux options avancées)
         const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'fatal' }),
-            browser: ["Mac OS", "Chrome", "124.0.0.0"]
+            browser: ["Ubuntu", "Chrome", "20.0.0.4"]
         });
 
-        // Demande directe du code de pairage après une attente de sécurité minimale
+        // Demande directe du code
         setTimeout(async () => {
             try {
                 let code = await sock.requestPairingCode(phoneNumber);
@@ -314,19 +310,17 @@ app.post('/pair', async (req, res) => {
             } catch (err) {
                 console.error("Erreur lors de la demande du code :", err);
                 if (!res.headersSent) {
-                    return res.json({ error: "WhatsApp refuse la demande. Vérifie le format du numéro." });
+                    return res.json({ error: "WhatsApp refuse la demande. Format incorrect ou trop d'essais." });
                 }
             }
         }, 3000);
 
-        // Capture de l'ouverture de session réussie
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
 
             if (connection === 'open') {
                 await delay(5000);
                 try {
-                    // Lecture sécurisée du creds.json généré
                     const credsPath = path.join(sessionDir, 'creds.json');
                     if (fs.existsSync(credsPath)) {
                         const credsFile = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
@@ -341,7 +335,6 @@ app.post('/pair', async (req, res) => {
                     console.error("Erreur d'écriture/envoi de session :", e);
                 }
 
-                // Déconnexion et nettoyage propre
                 await delay(2000);
                 try { sock.logout(); } catch(e){}
                 try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
@@ -353,11 +346,11 @@ app.post('/pair', async (req, res) => {
     } catch (error) {
         console.error("Crash d'initialisation Baileys :", error);
         if (!res.headersSent) {
-            res.json({ error: "Problème temporaire d'allocation des dossiers sur le serveur." });
+            res.json({ error: "Erreur critique d'initialisation du service de stockage." });
         }
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 prêt et allégé sur le port ${PORT}`);
+    console.log(`Serveur MIRA-BOT-V1 prêt et bypassé sur le port ${PORT}`);
 });
