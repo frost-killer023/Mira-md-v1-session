@@ -1,6 +1,7 @@
 {
   "name": "mira-bot-v1-panel",
   "version": "1.0.0",
+  "type": "module",
   "description": "Générateur de Session ID Glassmorphism pour MIRA-BOT-V1",
   "main": "server.js",
   "scripts": {
@@ -12,4 +13,3 @@
     "pino": "^9.1.0"
   }
 }
-
