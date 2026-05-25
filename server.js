@@ -1,5 +1,5 @@
 import express from 'express';
-import { default as makeWASocket, delay, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import { default as makeWASocket, delay, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { promises as fs } from 'fs';
 import path from 'path';
@@ -21,7 +21,7 @@ app.use(express.json());
 let socket = null;
 let socketInitializing = false;
 const socketReady = { ready: false };
-let socketReadyResolver = null;
+let qrCode = null;
 
 // Logger configuration
 const logger = pino({ level: 'silent' });
@@ -47,19 +47,14 @@ async function ensureSessionDirectory() {
 // INITIALIZE STABLE SOCKET ON SERVER START
 // ═════════════════════════════════════════════════════════════════
 async function initializeSocket() {
-  if (socket) {
-    console.log('🔄 Socket already exists, skipping re-initialization');
+  if (socket && socketReady.ready) {
+    console.log('🔄 Socket already exists and ready, skipping re-initialization');
     return socket;
   }
 
   if (socketInitializing) {
     console.log('⏳ Socket initialization already in progress...');
-    // Wait for initialization to complete
-    let attempts = 0;
-    while (socketInitializing && attempts < 120) {
-      await delay(100);
-      attempts++;
-    }
+    await delay(1000);
     return socket;
   }
 
@@ -72,7 +67,7 @@ async function initializeSocket() {
 
     console.log('🔐 Auth state loaded from ./session');
 
-    // Create socket instance with longer timeouts
+    // Create socket instance with proper configuration
     socket = makeWASocket({
       auth: state,
       printQRInTerminal: false,
@@ -81,10 +76,10 @@ async function initializeSocket() {
       syncFullHistory: false,
       markOnlineOnConnect: true,
       emitOwnEventsOnReceive: false,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-      shouldSyncHistoryMessage: false,
-      retryRequestDelayMs: 100
+      shouldCacheMessages: false,
+      generateHighQualityLinkPreview: false,
+      retryRequestDelayMs: 100,
+      maxRetries: 3
     });
 
     console.log('✅ Socket created successfully');
@@ -95,7 +90,12 @@ async function initializeSocket() {
 
     // Handle connection updates
     socket.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr: qrUpdate } = update;
+
+      if (qrUpdate) {
+        qrCode = qrUpdate;
+        console.log('📲 QR Code received - scan with WhatsApp');
+      }
 
       if (connection === 'connecting') {
         console.log('🔌 Connecting to WhatsApp...');
@@ -103,39 +103,26 @@ async function initializeSocket() {
 
       if (connection === 'open') {
         socketReady.ready = true;
+        qrCode = null;
         console.log('🟢 WhatsApp socket connected successfully');
         if (socket.user && socket.user.id) {
           console.log(`👤 User JID: ${socket.user.id}`);
-        }
-        // Call resolver if waiting
-        if (socketReadyResolver) {
-          socketReadyResolver();
-          socketReadyResolver = null;
         }
       }
 
       if (connection === 'close') {
         socketReady.ready = false;
-        const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
+        const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
 
         if (shouldReconnect) {
-          console.log('🔄 Connection closed, attempting to reconnect...');
-          setTimeout(() => {
-            socket = null;
-            socketInitializing = false;
-            initializeSocket().catch(err => {
-              console.error('🔄 Reconnection attempt failed:', err.message);
-            });
-          }, 3000);
+          console.log('🔄 Connection closed, will retry on next request...');
+          socket = null;
+          socketInitializing = false;
         } else {
-          console.log('❌ Connection closed: Logged out or invalid session');
+          console.log('❌ Connection closed: Logged out');
           socket = null;
           socketInitializing = false;
         }
-      }
-
-      if (qr) {
-        console.log('📲 QR Code generated (not needed for pairing code)');
       }
     });
 
@@ -157,41 +144,7 @@ async function initializeSocket() {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// WAIT FOR SOCKET READY WITH TIMEOUT
-// ═════════════════════════════════════════════════════════════════
-async function waitForSocketReady(timeoutMs = 45000) {
-  // If already ready, return immediately
-  if (socketReady.ready) {
-    console.log('✅ Socket already ready');
-    return true;
-  }
-
-  console.log(`⏳ Waiting for socket to be ready (${timeoutMs}ms timeout)...`);
-
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      console.log('⏱️ Socket ready timeout');
-      socketReadyResolver = null;
-      resolve(false);
-    }, timeoutMs);
-
-    socketReadyResolver = () => {
-      clearTimeout(timeout);
-      socketReadyResolver = null;
-      resolve(true);
-    };
-
-    // Check if already ready
-    if (socketReady.ready) {
-      clearTimeout(timeout);
-      socketReadyResolver = null;
-      resolve(true);
-    }
-  });
-}
-
-// ═════════════════════════════════════════════════════════════════
-// FRONTEND - Glassmorphism UI
+// FRONTEND - Glassmorphism UI with Status
 // ═════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.send(`
@@ -324,6 +277,7 @@ app.get('/', (req, res) => {
           gap: 8px;
           transition: 0.3s;
           box-shadow: 0 10px 20px rgba(114, 107, 243, 0.2);
+          margin-bottom: 15px;
         }
 
         button:hover {
@@ -337,8 +291,39 @@ app.get('/', (req, res) => {
           cursor: not-allowed;
         }
 
+        .status-box {
+          padding: 12px 16px;
+          background: rgba(91, 127, 255, 0.1);
+          border: 1px solid rgba(91, 127, 255, 0.3);
+          border-radius: 12px;
+          font-size: 12px;
+          color: #a4b3cd;
+          margin-bottom: 15px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .status-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: #5b7fff;
+          animation: pulse 2s infinite;
+        }
+
+        .status-dot.ready {
+          background: #4ade80;
+          animation: none;
+        }
+
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+
         .result-box {
-          margin-top: 30px;
+          margin-top: 15px;
           border: 1px dashed rgba(255, 255, 255, 0.15);
           border-radius: 16px;
           padding: 20px;
@@ -389,13 +374,18 @@ app.get('/', (req, res) => {
         <h1>MIRA-BOT-V1</h1>
         <div class="subtitle">Générateur de Code de Pairage</div>
 
+        <div class="status-box">
+          <div class="status-dot" id="statusDot"></div>
+          <span id="statusLabel">Connexion en cours...</span>
+        </div>
+
         <form id="pairingForm">
           <label class="input-label">Numéro de téléphone</label>
           <input type="text" id="phoneNumber" placeholder="Ex: 25766486303" required>
           
           <button type="submit" id="submitBtn">
             <svg style="width:18px; height:18px; fill:currentColor;" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            <span id="btnText">Générer</span>
+            <span id="btnText">Générer le Code</span>
           </button>
         </form>
 
@@ -406,6 +396,37 @@ app.get('/', (req, res) => {
       </div>
 
       <script>
+        // Check server status
+        async function checkStatus() {
+          try {
+            const response = await fetch('/health');
+            const data = await response.json();
+            const dot = document.getElementById('statusDot');
+            const label = document.getElementById('statusLabel');
+            const btn = document.getElementById('submitBtn');
+            
+            if (data.socketReady) {
+              dot.classList.add('ready');
+              label.textContent = '✅ Service prêt';
+              btn.disabled = false;
+            } else if (data.socketInitializing) {
+              dot.classList.remove('ready');
+              label.textContent = '🔌 Initialisation en cours...';
+              btn.disabled = true;
+            } else {
+              dot.classList.remove('ready');
+              label.textContent = '⏳ En attente...';
+              btn.disabled = false;
+            }
+          } catch (err) {
+            document.getElementById('statusLabel').textContent = '❌ Erreur de connexion';
+          }
+        }
+
+        // Check status every 2 seconds
+        checkStatus();
+        setInterval(checkStatus, 2000);
+
         document.getElementById('pairingForm').addEventListener('submit', async (e) => {
           e.preventDefault();
           const num = document.getElementById('phoneNumber').value.replace(/[^0-9]/g, '');
@@ -436,7 +457,7 @@ app.get('/', (req, res) => {
             loader.style.display = "none";
             statusText.style.display = "block";
             submitBtn.disabled = false;
-            btnText.innerText = "Générer";
+            btnText.innerText = "Générer le Code";
 
             if (data.code) {
               resultBox.style.borderStyle = "solid";
@@ -453,7 +474,7 @@ app.get('/', (req, res) => {
             loader.style.display = "none";
             statusText.style.display = "block";
             submitBtn.disabled = false;
-            btnText.innerText = "Générer";
+            btnText.innerText = "Générer le Code";
             statusText.innerHTML = "<span style='color: #ff5b5b;'>Échec de connexion au serveur de pairage.</span>";
           }
         });
@@ -464,7 +485,7 @@ app.get('/', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// PAIRING CODE ENDPOINT - FIXED & STABLE
+// PAIRING CODE ENDPOINT
 // ═════════════════════════════════════════════════════════════════
 app.post('/pair', async (req, res) => {
   const phoneNumber = req.body.number;
@@ -479,41 +500,30 @@ app.post('/pair', async (req, res) => {
 
   console.log(`📱 Pair request for number: ${phoneNumber}`);
 
-  // Safety timeout: 50 seconds
-  let responseSent = false;
-  const timeoutId = setTimeout(() => {
-    if (!responseSent) {
-      responseSent = true;
-      console.log('⏱️ Pairing timeout after 50 seconds');
-      return res.json({ error: 'Délai dépassé. Le serveur n\'a pas reçu le code WhatsApp. Réessayez.' });
-    }
-  }, 50000);
-
   try {
-    // Ensure socket is initialized
+    // Initialize socket if not already done
     if (!socket) {
-      console.log('🔧 Socket not initialized, starting initialization...');
+      console.log('🔧 Socket not initialized, initializing...');
       await initializeSocket();
     }
 
-    // Wait for socket to be ready (45 seconds max)
-    const isReady = await waitForSocketReady(45000);
+    // Wait for socket to be ready (up to 60 seconds)
+    let attempts = 0;
+    while (!socketReady.ready && attempts < 60) {
+      console.log(`⏳ Waiting for socket... (${attempts + 1}/60)`);
+      await delay(1000);
+      attempts++;
+    }
 
-    if (!isReady) {
-      clearTimeout(timeoutId);
-      responseSent = true;
-      console.log('❌ Socket not ready after waiting');
-      return res.json({ error: 'Le service de pairage met du temps à se connecter. Veuillez réessayer.' });
+    if (!socketReady.ready) {
+      console.log('❌ Socket not ready after 60 seconds');
+      return res.json({ error: 'Le service ne peut pas se connecter à WhatsApp. Réessayez dans 30 secondes.' });
     }
 
     console.log('✅ Socket ready, requesting pairing code...');
 
     // Request pairing code from WhatsApp
     const pairingCode = await socket.requestPairingCode(phoneNumber);
-    
-    clearTimeout(timeoutId);
-    if (responseSent) return;
-    responseSent = true;
 
     console.log(`✅ Pairing code generated: ${pairingCode}`);
 
@@ -528,7 +538,7 @@ app.post('/pair', async (req, res) => {
       if (!connectionConfirmed) {
         console.log('⚠️ Connection confirmation timeout');
       }
-    }, 60000);
+    }, 120000); // 2 minutes
 
     // Listen for successful connection
     const handleConnection = async (update) => {
@@ -573,7 +583,6 @@ app.post('/pair', async (req, res) => {
           console.error('⚠️ Error sending confirmation message:', error.message);
         }
 
-        // Don't logout - keep session active
         console.log('💾 Session saved and active');
       }
     };
@@ -581,31 +590,27 @@ app.post('/pair', async (req, res) => {
     socket.ev.on('connection.update', handleConnection);
 
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (!responseSent) {
-      responseSent = true;
-      console.error('❌ Pairing error:', error.message);
+    console.error('❌ Pairing error:', error.message);
 
-      // Return user-friendly error message
-      let errorMessage = 'Erreur du service de pairage';
-      
-      if (error.message.includes('Invalid pairing code')) {
-        errorMessage = 'Code de pairage invalide. Vérifiez que vous avez saisi le bon numéro.';
-      } else if (error.message.includes('timeout') || error.message.includes('Timeout')) {
-        errorMessage = 'WhatsApp a mis trop de temps à répondre. Réessayez.';
-      } else if (error.message.includes('connection') || error.message.includes('Connection')) {
-        errorMessage = 'Impossible de se connecter à WhatsApp. Vérifiez votre connexion Internet.';
-      } else if (error.message.includes('network')) {
-        errorMessage = 'Erreur réseau. Réessayez dans quelques secondes.';
-      }
-
-      res.json({ error: errorMessage });
+    // Return user-friendly error message
+    let errorMessage = 'Erreur du service de pairage';
+    
+    if (error.message.includes('Invalid pairing code')) {
+      errorMessage = 'Code de pairage invalide. Vérifiez que vous avez saisi le bon numéro.';
+    } else if (error.message.includes('timeout') || error.message.includes('Timeout')) {
+      errorMessage = 'WhatsApp a mis trop de temps à répondre. Réessayez.';
+    } else if (error.message.includes('connection') || error.message.includes('Connection')) {
+      errorMessage = 'Impossible de se connecter à WhatsApp. Vérifiez votre connexion Internet.';
+    } else if (error.message.includes('network')) {
+      errorMessage = 'Erreur réseau. Réessayez dans quelques secondes.';
     }
+
+    res.json({ error: errorMessage });
   }
 });
 
 // ═════════════════════════════════════════════════════════════════
-// HEALTH CHECK ENDPOINT (pour monitoring)
+// HEALTH CHECK ENDPOINT
 // ═════════════════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({ 
@@ -640,10 +645,10 @@ async function startServer() {
       console.log('');
     });
 
-    // Initialize socket in background (don't wait)
+    // Initialize socket in background
     initializeSocket().catch(err => {
       console.error('⚠️ Initial socket initialization failed:', err.message);
-      console.log('💡 Socket will retry on first pairing request');
+      console.log('💡 Socket will initialize on first pairing request');
     });
 
   } catch (error) {
