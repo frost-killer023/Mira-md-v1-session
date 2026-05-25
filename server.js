@@ -6,7 +6,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Gestion de __dirname compatible avec ES Modules (ESM)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -16,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Interface Ultra-Stylisée Glassmorphism (Inspirée de ta capture)
+// Interface Graphique
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -215,7 +214,7 @@ app.get('/', (req, res) => {
 
                 <form id="pairingForm">
                     <label class="input-label">Numéro de téléphone</label>
-                    <input type="text" id="phoneNumber" placeholder="+257 XX XX XX XX" required>
+                    <input type="text" id="phoneNumber" placeholder="Ex: 25766486303" required>
                     
                     <button type="submit" id="submitBtn">
                         <svg style="width:18px; height:18px; fill:currentColor;" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
@@ -282,15 +281,19 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Logique Baileys d'authentification par code
+// Logique de génération optimisée pour Linux / Render
 app.post('/pair', async (req, res) => {
     let phoneNumber = req.body.number;
     if (!phoneNumber) return res.status(400).json({ error: "Numéro manquant" });
 
-    const sessionDir = path.join(__dirname, './temp_session_' + phoneNumber);
-    if (fs.existsSync(sessionDir)) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-    }
+    // Dossier temporaire unique
+    const sessionDir = path.join(__dirname, 'session_' + phoneNumber);
+    
+    try {
+        if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+    } catch(e) {}
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -298,20 +301,22 @@ app.post('/pair', async (req, res) => {
         const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'silent' }),
-            browser: ["Ubuntu", "Chrome", "20.0.0"]
+            logger: pino({ level: 'fatal' }), // Évite de surcharger les logs Render
+            browser: ["Chrome (Linux)", "Chrome", "124.0.0.0"] // Simulation d'un navigateur standard stable
         });
 
-        setTimeout(async () => {
-            try {
-                let code = await sock.requestPairingCode(phoneNumber);
-                if (!res.headersSent) {
-                    res.json({ code: code });
-                }
-            } catch (err) {
-                if (!res.headersSent) res.json({ error: "Génération impossible." });
+        // Attente de l'initialisation interne avant demande de code
+        await delay(3000);
+
+        try {
+            let code = await sock.requestPairingCode(phoneNumber);
+            if (!res.headersSent) {
+                res.json({ code: code });
             }
-        }, 3000);
+        } catch (err) {
+            console.error(err);
+            if (!res.headersSent) return res.json({ error: "Génération du code refusée par WhatsApp. Réessaye." });
+        }
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
@@ -319,23 +324,27 @@ app.post('/pair', async (req, res) => {
             if (connection === 'open') {
                 await delay(5000);
                 
-                const credsFile = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf-8'));
-                const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
-                const finalSessionId = `Session_id_mira-bot:\${sessionB64}`;
+                try {
+                    const credsFile = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf-8'));
+                    const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
+                    const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
 
-                const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\\n│ ߷ *Etat* ➜ Connecté ✅\\n│ ߷ *Préfixe* ➜ !\\n│ ߷ *Mode* ➜ Public\\n│ ߷ *Commandes* ➜ Multi-Device\\n│ ߷ *Version* ➜ 1.0.0\\n│ ߷ *Développeur*➜ anos \\n╰──────────────⬣\\n\\nCopie ton ID de session ci-dessous pour le configurer sur Render ou via GitHub Actions :\\n\\n\${finalSessionId}`;
+                    const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur Render ou via GitHub Actions :\n\n${finalSessionId}`;
 
-                await sock.sendMessage(sock.user.id, { text: successMessage });
+                    await sock.sendMessage(sock.user.id, { text: successMessage });
+                } catch(e) {
+                    console.log("Erreur lors de l'envoi du message de session ID: ", e);
+                }
                 
                 await delay(2000);
                 try { sock.logout(); } catch(e) {}
-                fs.rmSync(sessionDir, { recursive: true, force: true });
+                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
             }
 
             if (connection === 'close') {
                 const reason = lastDisconnect?.error?.output?.statusCode;
                 if (reason !== disconnectReason.loggedOut) {
-                    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                    // Gère les fermetures silencieuses
                 }
             }
         });
@@ -343,10 +352,11 @@ app.post('/pair', async (req, res) => {
         sock.ev.on('creds.update', saveCreds);
 
     } catch (error) {
-        if (!res.headersSent) res.json({ error: "Erreur serveur." });
+        console.error("Global error in /pair:", error);
+        if (!res.headersSent) res.json({ error: "Le serveur a rencontré un problème d'initialisation." });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 en ligne sur le port \${PORT}`);
+    console.log(`Serveur MIRA-BOT-V1 stabilisé en ligne sur le port ${PORT}`);
 });
