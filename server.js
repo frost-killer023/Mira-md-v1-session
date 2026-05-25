@@ -1,8 +1,7 @@
 import express from 'express';
 import baileys from '@whiskeysockets/baileys';
-const { default: makeWASocket, delay, initAuthState } = baileys;
+const { default: makeWASocket, delay, initAuthCreds } = baileys;
 import pino from 'pino';
-import Crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Interface Graphique Glassmorphism
+// Interface Graphique Glassmorphism (inchangée)
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -276,63 +275,79 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Logique 100% In-Memory (Zéro écriture de fichier, impossible à bloquer par Render)
+// Logique corrigée — 100% In-Memory avec initAuthCreds (Baileys v6)
 app.post('/pair', async (req, res) => {
     let phoneNumber = req.body.number;
     if (!phoneNumber) return res.status(400).json({ error: "Numéro manquant" });
 
-    try {
-        // Initialisation d'un état d'authentification vierge directement en RAM
-        const creds = initAuthState().creds || {
-            noiseKey: Crypto.randomBytes(32),
-            signedIdentityKey: Crypto.randomBytes(32),
-            signedPreKey: {
-                keyPair: Crypto.randomBytes(32),
-                signature: Crypto.randomBytes(64),
-                keyId: 1
-            },
-            registrationId: Math.floor(Math.random() * 2000),
-            advSecretKey: Crypto.randomBytes(32).toString('base64'),
-            processedHistoryMessages: [],
-            nextPreKeyId: 1,
-            firstUnuploadedPreKeyId: 1,
-            accountSettings: { unarchiveChats: false },
-            registered: false,
-            me: undefined,
-            signalIdentities: [],
-            lastAccountSyncTimestamp: undefined,
-            platform: 'android'
-        };
+    let sock;
 
+    // Timeout de sécurité : 25 secondes (évite les requêtes bloquées sur Render)
+    const safetyTimeout = setTimeout(() => {
+        if (!res.headersSent) {
+            res.json({ error: "Délai dépassé. Veuillez réessayer." });
+        }
+        try { if (sock) sock.end(undefined); } catch (e) {}
+    }, 25000);
+
+    try {
+        // ✅ CORRECTIF PRINCIPAL : initAuthCreds() est la bonne fonction dans Baileys v6
+        const creds = initAuthCreds();
+
+        // ✅ CORRECTIF SECONDAIRE : store de clés en mémoire structuré correctement
+        const keysStore = {};
         const state = {
-            creds: creds,
+            creds,
             keys: {
-                get: (type, ids) => { return {}; },
-                set: (data) => {} // On ignore les écritures de clés intermédiaires
+                get: async (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        const value = keysStore[`${type}-${id}`];
+                        if (value !== undefined) data[id] = value;
+                    }
+                    return data;
+                },
+                set: async (data) => {
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            if (value != null) {
+                                keysStore[`${category}-${id}`] = value;
+                            } else {
+                                delete keysStore[`${category}-${id}`];
+                            }
+                        }
+                    }
+                }
             }
         };
 
-        const sock = makeWASocket({
+        sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'fatal' }),
             browser: ["Mac OS", "Chrome", "124.0.0.0"]
         });
 
-        // Demande directe du code de pairage
+        // ✅ Demande du code de pairage après 2s (socket suffisamment initialisé)
+        let codeRequested = false;
         setTimeout(async () => {
+            if (codeRequested) return;
+            codeRequested = true;
             try {
-                let code = await sock.requestPairingCode(phoneNumber);
+                const code = await sock.requestPairingCode(phoneNumber);
+                clearTimeout(safetyTimeout);
                 if (!res.headersSent) {
-                    return res.json({ code: code });
+                    return res.json({ code });
                 }
             } catch (err) {
-                console.error("Erreur lors de la demande du code :", err);
+                console.error("Erreur requestPairingCode :", err.message);
+                clearTimeout(safetyTimeout);
                 if (!res.headersSent) {
-                    return res.json({ error: "WhatsApp a rejeté la demande. Vérifie le format du numéro." });
+                    return res.json({ error: "WhatsApp a rejeté la demande. Vérifiez le format du numéro (ex: 25766486303)." });
                 }
             }
-        }, 3000);
+        }, 2000);
 
         // Envoi de la session dès la connexion réussie
         sock.ev.on('connection.update', async (update) => {
@@ -341,7 +356,6 @@ app.post('/pair', async (req, res) => {
             if (connection === 'open') {
                 await delay(5000);
                 try {
-                    // Récupération des creds finaux directement depuis la mémoire vive
                     const finalCreds = sock.authState.creds;
                     const sessionB64 = Buffer.from(JSON.stringify(finalCreds)).toString('base64');
                     const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
@@ -354,18 +368,23 @@ app.post('/pair', async (req, res) => {
                 }
 
                 await delay(2000);
-                try { sock.logout(); } catch(e){}
+                try { sock.logout(); } catch (e) {}
+            }
+
+            if (connection === 'close') {
+                clearTimeout(safetyTimeout);
             }
         });
 
     } catch (error) {
-        console.error("Crash d'initialisation en mémoire virtuelle :", error);
+        clearTimeout(safetyTimeout);
+        console.error("Erreur d'initialisation :", error);
         if (!res.headersSent) {
-            res.json({ error: "Échec de l'allocation de la mémoire virtuelle." });
+            res.json({ error: "Erreur d'initialisation du service de pairage." });
         }
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 sécurisé en mémoire vive sur le port ${PORT}`);
+    console.log(`✅ Serveur MIRA-BOT-V1 démarré sur le port ${PORT}`);
 });
