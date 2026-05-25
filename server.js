@@ -1,8 +1,14 @@
-const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, delay, disconnectReason } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
+import express from 'express';
+import baileys from '@whiskeysockets/baileys';
+const { default: makeWASocket, useMultiFileAuthState, delay, disconnectReason } = baileys;
+import pino from 'pino';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Gestion de __dirname compatible avec ES Modules (ESM)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,7 +35,6 @@ app.get('/', (req, res) => {
                 body {
                     font-family: 'Plus Jakarta Sans', sans-serif;
                     background: #090d1a;
-                    /* Dégradé d'ambiance en arrière-plan */
                     background-image: 
                         radial-gradient(circle at 10% 20%, rgba(91, 127, 255, 0.15) 0%, transparent 40%),
                         radial-gradient(circle at 90% 80%, rgba(144, 83, 205, 0.15) 0%, transparent 45%);
@@ -43,7 +48,6 @@ app.get('/', (req, res) => {
                     box-sizing: border-box;
                 }
 
-                /* Conteneur principal style "Glass" */
                 .card {
                     background: rgba(255, 255, 255, 0.03);
                     backdrop-filter: blur(20px);
@@ -57,7 +61,6 @@ app.get('/', (req, res) => {
                     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
                 }
 
-                /* Logo de code violet brillant */
                 .icon-container {
                     width: 70px;
                     height: 70px;
@@ -158,7 +161,6 @@ app.get('/', (req, res) => {
                     cursor: not-allowed;
                 }
 
-                /* Zone de résultat en bas */
                 .result-box {
                     margin-top: 30px;
                     border: 1px dashed rgba(255, 255, 255, 0.15);
@@ -235,8 +237,8 @@ app.get('/', (req, res) => {
                     const statusText = document.getElementById('statusText');
                     const submitBtn = document.getElementById('submitBtn');
                     const btnText = document.getElementById('btnText');
+                    const resultBox = document.getElementById('resultBox');
 
-                    // Animation de chargement
                     submitBtn.disabled = true;
                     loader.style.display = "block";
                     statusText.style.display = "none";
@@ -319,15 +321,14 @@ app.post('/pair', async (req, res) => {
                 
                 const credsFile = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf-8'));
                 const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
-                const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
+                const finalSessionId = `Session_id_mira-bot:\${sessionB64}`;
 
-                // Ton menu de succès avec l'identité de ton bot
-                const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur Render ou via GitHub Actions :\n\n${finalSessionId}`;
+                const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\\n│ ߷ *Etat* ➜ Connecté ✅\\n│ ߷ *Préfixe* ➜ !\\n│ ߷ *Mode* ➜ Public\\n│ ߷ *Commandes* ➜ Multi-Device\\n│ ߷ *Version* ➜ 1.0.0\\n│ ߷ *Développeur*➜ anos \\n╰──────────────⬣\\n\\nCopie ton ID de session ci-dessous pour le configurer sur Render ou via GitHub Actions :\\n\\n\${finalSessionId}`;
 
                 await sock.sendMessage(sock.user.id, { text: successMessage });
                 
                 await delay(2000);
-                sock.logout();
+                try { sock.logout(); } catch(e) {}
                 fs.rmSync(sessionDir, { recursive: true, force: true });
             }
 
@@ -347,6 +348,5 @@ app.post('/pair', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 en ligne sur le port ${PORT}`);
+    console.log(`Serveur MIRA-BOT-V1 en ligne sur le port \${PORT}`);
 });
-
