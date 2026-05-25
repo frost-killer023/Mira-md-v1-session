@@ -1,10 +1,8 @@
 import express from 'express';
 import baileys from '@whiskeysockets/baileys';
-const { default: makeWASocket, useMultiFileAuthState, delay } = baileys;
+const { default: makeWASocket, delay, initAuthState } = baileys;
 import pino from 'pino';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
+import Crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Interface Graphique
+// Interface Graphique Glassmorphism
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -278,29 +276,50 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Logique utilisant le dossier système /tmp (autorisé sur Render)
+// Logique 100% In-Memory (Zéro écriture de fichier, impossible à bloquer par Render)
 app.post('/pair', async (req, res) => {
     let phoneNumber = req.body.number;
     if (!phoneNumber) return res.status(400).json({ error: "Numéro manquant" });
 
-    // Utilisation du dossier /tmp du système d'exploitation Linux
-    const sessionDir = path.join(os.tmpdir(), 'mira_sess_' + phoneNumber);
-
-    if (fs.existsSync(sessionDir)) {
-        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
-    }
-
     try {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        
+        // Initialisation d'un état d'authentification vierge directement en RAM
+        const creds = initAuthState().creds || {
+            noiseKey: Crypto.randomBytes(32),
+            signedIdentityKey: Crypto.randomBytes(32),
+            signedPreKey: {
+                keyPair: Crypto.randomBytes(32),
+                signature: Crypto.randomBytes(64),
+                keyId: 1
+            },
+            registrationId: Math.floor(Math.random() * 2000),
+            advSecretKey: Crypto.randomBytes(32).toString('base64'),
+            processedHistoryMessages: [],
+            nextPreKeyId: 1,
+            firstUnuploadedPreKeyId: 1,
+            accountSettings: { unarchiveChats: false },
+            registered: false,
+            me: undefined,
+            signalIdentities: [],
+            lastAccountSyncTimestamp: undefined,
+            platform: 'android'
+        };
+
+        const state = {
+            creds: creds,
+            keys: {
+                get: (type, ids) => { return {}; },
+                set: (data) => {} // On ignore les écritures de clés intermédiaires
+            }
+        };
+
         const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'fatal' }),
-            browser: ["Ubuntu", "Chrome", "20.0.0.4"]
+            browser: ["Mac OS", "Chrome", "124.0.0.0"]
         });
 
-        // Demande directe du code
+        // Demande directe du code de pairage
         setTimeout(async () => {
             try {
                 let code = await sock.requestPairingCode(phoneNumber);
@@ -310,47 +329,43 @@ app.post('/pair', async (req, res) => {
             } catch (err) {
                 console.error("Erreur lors de la demande du code :", err);
                 if (!res.headersSent) {
-                    return res.json({ error: "WhatsApp refuse la demande. Format incorrect ou trop d'essais." });
+                    return res.json({ error: "WhatsApp a rejeté la demande. Vérifie le format du numéro." });
                 }
             }
         }, 3000);
 
+        // Envoi de la session dès la connexion réussie
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
 
             if (connection === 'open') {
                 await delay(5000);
                 try {
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    if (fs.existsSync(credsPath)) {
-                        const credsFile = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-                        const sessionB64 = Buffer.from(JSON.stringify(credsFile)).toString('base64');
-                        const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
+                    // Récupération des creds finaux directement depuis la mémoire vive
+                    const finalCreds = sock.authState.creds;
+                    const sessionB64 = Buffer.from(JSON.stringify(finalCreds)).toString('base64');
+                    const finalSessionId = `Session_id_mira-bot:${sessionB64}`;
 
-                        const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur ton bot :\n\n${finalSessionId}`;
+                    const successMessage = `╭───〔 🤖 MIRA 𝘽𝙊𝙏 〕───⬣\n│ ߷ *Etat* ➜ Connecté ✅\n│ ߷ *Préfixe* ➜ !\n│ ߷ *Mode* ➜ Public\n│ ߷ *Commandes* ➜ Multi-Device\n│ ߷ *Version* ➜ 1.0.0\n│ ߷ *Développeur*➜ anos \n╰──────────────⬣\n\nCopie ton ID de session ci-dessous pour le configurer sur ton bot :\n\n${finalSessionId}`;
 
-                        await sock.sendMessage(sock.user.id, { text: successMessage });
-                    }
+                    await sock.sendMessage(sock.user.id, { text: successMessage });
                 } catch (e) {
-                    console.error("Erreur d'écriture/envoi de session :", e);
+                    console.error("Erreur d'envoi du message de session ID :", e);
                 }
 
                 await delay(2000);
                 try { sock.logout(); } catch(e){}
-                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
             }
         });
 
-        sock.ev.on('creds.update', saveCreds);
-
     } catch (error) {
-        console.error("Crash d'initialisation Baileys :", error);
+        console.error("Crash d'initialisation en mémoire virtuelle :", error);
         if (!res.headersSent) {
-            res.json({ error: "Erreur critique d'initialisation du service de stockage." });
+            res.json({ error: "Échec de l'allocation de la mémoire virtuelle." });
         }
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur MIRA-BOT-V1 prêt et bypassé sur le port ${PORT}`);
+    console.log(`Serveur MIRA-BOT-V1 sécurisé en mémoire vive sur le port ${PORT}`);
 });
